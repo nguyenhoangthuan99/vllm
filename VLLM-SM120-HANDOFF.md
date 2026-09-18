@@ -523,6 +523,74 @@ Commit `fb89f90a1`'s subject line reads "the KV cache tank shape"; it should rea
 "tensor shape". Cosmetic only, but the commit is already published so the
 subject is not being rewritten; the message itself is correct.
 
+
+## 2g. MEASURED ROOT CAUSE (2026-09-18) — the page size is `attention.py:529`
+
+The instrumented run finally answered it. Excerpt from `/tmp/recon.log`:
+
+```
+INFO [interface.py:621] Setting kv cache block size to 128 for FLASHINFER_MLA_SPARSE_DSV41 backend.
+INFO [utils.py:320]     Using BLHNC KV cache layout.
+ERROR [multiproc_executor.py:1053] ValueError: SM120 sparse-MLA has no decode kernel
+      for this shape: num_tokens=2, num_heads=8, topk=128, d_qk=512,
+      page_block_size=32, model_type=1, extra_topk=0.
+SMLADBG_CACHE shape=(133619, 32, 1, 584) strides=(230400, 584, 584, 1)
+              dtype=torch.uint8 ndim=4 impl_page_block_size=32 (need 64)
+```
+
+**The tensor handed to FlashInfer has 32 tokens per page.** FlashInfer's
+`_packed_kv_page_block_size` reads `shape[1] == 32` (NHD, since `shape[2] == 1`)
+and compares it against `_DECODE_DSV4_PAGE_BLOCK_SIZE == 64`.
+
+### Where 32 comes from — three candidate sites, one of them explicit
+1. `vllm/models/deepseek_v41/attention.py:529` —
+   `DeepseekV4SWACache(..., block_size=32, ...)`. **This is an explicit
+   `block_size=32` argument.**
+2. `sparse_swa.py:83` — the class *default* is `block_size: int = 64`, so
+   something is deliberately passing 32.
+3. `sparse_swa.py:114-116` — `self.block_size = block_size` with the comment
+   *"Any multiple of 32; the sparse decode kernels take the page size at
+   runtime."*
+
+### Every earlier hypothesis was wrong; this one is measured
+| hypothesis | verdict |
+|---|---|
+| `index_kpool` guard skips SM120 alignment | **wrong** — that path is hybrid-mamba only |
+| `128 // compress_ratio == 32` implies ratio 4 | **wrong** — checkpoint has no ratio 4; 128//{1,2} = {128,64} |
+| page size read from a vLLM config value | **wrong** — it is read from the tensor shape |
+
+The `Setting kv cache block size to 128` log line and the measured
+`shape[1] == 32` are consistent only if the **manager block (128)** and the
+**cache page (32)** are different quantities — which they are: the former is
+`cache_config.block_size`, the latter is `DeepseekV4SWACache.block_size`.
+
+### Stride caveat (unresolved, and it matters)
+`strides=(230400, 584, 584, 1)` with payload `32 * 584 = 18688`, and
+`align_up(18688, 512) = 18944 != 230400`. So `stride[0]` is **not** this page's
+own content — the cache is a shared/unified allocation whose page stride spans
+something larger. Do not assume `stride[0] == block_size * bytes_per_token` when
+computing a fix.
+
+`230400 = 450 * 512` exactly, and `packed_page_alignment` is `512` when
+`kv_mxfp8` (`attention.py:508`). The relationship between 450, the 32-token page
+and the number of pages (`133619`) needs one more measurement.
+
+### Why the run is still valuable despite `PYTHONPATH` not propagating
+`PYTHONPATH` was lost between the wrapper shell and vLLM's subprocesses, so the
+server ran from `cwd=/build`, which shadowed the installed package via
+`sys.path[0]`. `/build/vllm` *is* the newly built tree, so the run genuinely
+exercised the SM120 code — and the `SMLADBG_CACHE` line did fire (on TP7).
+Only the `_SMLADBG_log` instrumentation in `_forward_sparse_impl` did not,
+because it sits after the failing dispatch.
+
+### Serving the logs while a run is live
+```
+python3 -m http.server 8899 --bind 0.0.0.0 --directory /var/log/dsv41
+```
+with a loop that re-copies `docker exec <c> cat /tmp/recon.log` every 5 s.
+Guard each `docker exec` with `timeout` — an unguarded one in a slow container
+wedged the refresh loop and made a healthy run look stalled.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
