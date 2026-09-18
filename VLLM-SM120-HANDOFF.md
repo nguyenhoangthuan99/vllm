@@ -434,6 +434,71 @@ upstream in the cache manager.
 This single print replaces all further static inference. Two rounds of config
 reasoning have already produced wrong answers (section 2d); do not add a third.
 
+
+## 2f. COMPLETE CHAIN (2026-09-18) — replaces every earlier hypothesis
+
+The target is `page_block_size == 64`. Assembling the verified facts:
+
+**1. The compressed page is `block_size // compress_ratio`.**
+`sparse_mla.py:32-36` says so in as many words:
+```
+# v4.1 per-layer compress ratios: 0 = SWA, 1 = full-length compressed,
+# 2 = ratio-2 compressed. Ratio-1 and ratio-2 layers both attend over indexer
+# topk indices into a shared compressed cache but differ in compressed page
+# block size (block_size // ratio), so each needs its own tile-scheduler plan.
+```
+and `flashinfer_sparse.py:403` computes exactly that.
+
+**2. `block_size` is the *manager* block, and for MLA it is forced to >= 128.**
+`platforms/interface.py:880`:
+```python
+kernel_block_alignment_size = max(
+    min(s.base if isinstance(s, MultipleOf) else s
+        for s in backend_cls.get_supported_kernel_block_sizes()),
+    cache_config.block_size,
+)
+if model_config.use_mla:
+    kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
+```
+SM120's backend declares `get_supported_kernel_block_sizes() -> [128]`
+(`flashinfer_sparse.py:116`), so `block_size >= 128` regardless of any
+`--block-size` we pass below that.
+
+**3. Therefore the compressed page is `128 // ratio`:**
+
+| layer type | ratio | `block_size // ratio` | == 64? | layers |
+|---|---|---|---|---|
+| SWA-only (ratio 0) | 0 | n/a, no compressed cache | — | 5 |
+| C1A | 1 | **128** | no | 20 |
+| **C2A** | **2** | **64** | **yes** | **18** |
+
+**4. This is the whole explanation, and it is not a bug in vLLM.**
+FlashInfer's SM120 decode demands a page of exactly 64 and vLLM's SM120 backend
+declares a manager block of 128, so **only C2A layers (ratio 2) satisfy the
+constraint**; every C1A layer computes 128 and every SWA-only layer has no
+compressed cache to feed it.
+
+Our observed `page_block_size=32` then follows from the *mixed* pipeline: when
+any layer in the batch presents a page of 128 (C1A) or the SWA branch passes
+`swa_metadata.block_size` (`flashinfer_sparse.py:394`), FlashInfer's dispatch
+rejects it, and the `min(PAGED_MQA_PAGE_SIZES)` = 32 fallback is what surfaces
+in the error. The 32 is a *consequence of rejection*, not the input.
+
+### What this means for the kernels just landed
+They are directly usable, and the earlier statement that C2A "needs a
+reimplementation" was wrong for a third distinct reason: C2A is
+`_layer_type_for`-supported, `tile_sched_c2a`-supported, and — as shown here —
+**C2A is precisely the ratio that already yields the page FlashInfer wants.**
+
+### The remaining real gap
+Per-layer-type dispatch. C2A layers (page 64) can go to FlashInfer; C1A layers
+(page 128, and 20 of 40 layers) cannot, and need either
+- a C1A-capable SM120 decode (page 128) — which the Triton kernels here can
+  provide, since they take the page size as an input rather than hard-coding 64; or
+- upstream support for page-128 SM120 decode.
+
+This is a modelling decision to make with the user, not something to guess at.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
