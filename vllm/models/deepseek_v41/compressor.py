@@ -106,26 +106,35 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         num_tokens = common_attn_metadata.slot_mapping.numel()
         positions = common_attn_metadata.positions
         assert positions is not None
+        # CUDA graphs replay a captured launch, so the grid and the slice length
+        # must not depend on the runtime token count: capture and replay would
+        # otherwise disagree. The kernel already masks every access by
+        # `num_actual_tokens` and bounds its stores by `num_tokens`, so a grid
+        # covering the whole persistent buffer is safe and replays exactly.
+        padded_tokens = self.slot_mapping_buffer.numel()
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
             self.token_to_req_indices
         )
-        slot_mapping = self.slot_mapping_buffer[:num_tokens]
+        # `token_to_req_indices` returns a runtime-sized slice; retarget it to
+        # the fixed-size buffer region the kernel actually reads.
+        token_to_req_indices = self.token_to_req_indices[: token_to_req_indices.numel()]
+        slot_mapping = self.slot_mapping_buffer[:padded_tokens]
         block_table = common_attn_metadata.block_table_tensor
-        _ring_slot_mapping_kernel[(triton.cdiv(num_tokens, 256),)](
+        _ring_slot_mapping_kernel[(triton.cdiv(padded_tokens, 256),)](
             slot_mapping,
             block_table,
             block_table.stride(0),
             token_to_req_indices,
             positions,
             common_attn_metadata.num_actual_tokens,
-            num_tokens,
+            padded_tokens,
             CAPACITY=self.capacity,
             BLOCK=256,
         )
         return CompressorMetadata(
-            slot_mapping=slot_mapping,
+            slot_mapping=slot_mapping[:num_tokens],
             query_start_loc=common_attn_metadata.query_start_loc,
-            token_to_req_indices=token_to_req_indices,
+            token_to_req_indices=token_to_req_indices[:num_tokens],
         )
 
 

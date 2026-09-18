@@ -1234,6 +1234,86 @@ async reporting. Confirming needs `CUDA_LAUNCH_BLOCKING=1` — not done.
 CUDA graphs remain unvalidated; do not enable them for this checkpoint yet.
 Also still unmeasured: contexts between 8,192 and 65,536, and throughput.
 
+
+---
+
+# SECTION 7 — CUDA GRAPH FIX, PARTIAL: COMPRESSOR FIXED, INDEXER STILL BREAKS
+
+Supersedes section 6's single-cause framing. There are **at least two**
+independent graph-breaking paths; one is now fixed and one is not.
+
+## 7.1 Cause 1 — compressor ring-slot mapping (FIXED)
+
+`CompressorMetadataBuilder.build` (`models/deepseek_v41/compressor.py`) launched
+with shapes derived from the runtime token count while declaring
+`_cudagraph_support = ALWAYS`:
+
+```python
+num_tokens   = common_attn_metadata.slot_mapping.numel()   # varies per step
+slot_mapping = self.slot_mapping_buffer[:num_tokens]        # runtime-sized slice
+_ring_slot_mapping_kernel[(triton.cdiv(num_tokens, 256),)]  # runtime-sized grid
+```
+
+Capture and replay therefore disagreed on both the slice address and the grid.
+
+**Fix:** drive the grid, the slice, and the `num_tokens` argument from the
+persistent buffer size instead of the runtime token count, and return the
+runtime-sized view only in the metadata. The kernel already masks every load by
+`num_actual_tokens` and every store by `num_tokens`, so covering the whole
+buffer is safe; lanes past `num_actual_tokens` now receive the `-1` sentinel the
+kernel already specified via `tl.where(valid, slot, -1)`.
+
+**Verified, not assumed:** after the fix `_ring_slot_mapping_kernel` no longer
+appears in the `jit_monitor` "compiled during inference" warnings, and the
+server **survives** graph mode (HTTP 200) where it previously died with
+`CUDA error: an illegal memory access was encountered`.
+
+## 7.2 Cause 2 — candidate-block selection (NOT FIXED)
+
+Output is still empty with `finish_reason=length`. The next kernels to compile
+during inference are in
+`model_executor/kernels/attention/dsa/candidate_blocks.py`:
+
+```
+_block_scores_kernel, _candidate_flags_kernel, _mask_candidates_kernel
+```
+
+These take `width` / `nblocks` / `k` as **runtime scalars** and derive their
+grids from them, plus allocate inside the captured region:
+
+```python
+rows, width = logits.shape
+nblocks = triton.cdiv(width, block_size)
+scores  = logits.new_empty((rows, nblocks))          # allocation
+_block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](...)
+_mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](...)
+```
+
+They run on the **decode** path via `sparse_attn_indexer.py:735,745` — exactly
+what a single-token graph replay executes.
+
+**Likely mechanism:** the captured candidate grid/flags do not match the replay
+shape, no candidate blocks survive, the indexer emits no top-k positions, sparse
+attention has nothing to attend, and the sampler stops immediately. That is
+consistent with the observed empty string plus `length` at every `max_tokens`,
+including 1.
+
+**Not established:** this is a plausible reading of the call graph, not a
+measurement. Pinning it needs `CUDA_LAUNCH_BLOCKING=1` or a decode-step capture
+with per-kernel shapes dumped.
+
+## 7.3 Status
+
+| item | state |
+|---|---|
+| compressor graph path | **fixed**, evidenced by log change |
+| crash on graph replay | **gone**, server survives |
+| correct graph output | **not achieved** |
+| graph throughput | unmeasurable until output is correct |
+
+**Eager at 8,192 remains the validated configuration** (sections 4–5) and is
+unaffected by these changes.
+
 ---
 
 # APPENDIX A — DRAFT upstream issue (NOT FILED — user asked to hold)
