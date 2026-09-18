@@ -977,6 +977,131 @@ Decode is solved; prefill for ratio-2 layers is the remaining gap.
 - 2m (this section) establishes *why* 32 cannot work: no kernel instantiation.
 
 
+
+---
+
+# SECTION 4 — PAGE-32 PREFILL: SOLVED, AND WHAT IT EXPOSED
+
+Measured on .106, 2026-09-18. Supersedes Appendix A's "architectural gap"
+framing: page32 needed **kernel instantiations, not a format change**.
+
+## 4.1 The correction to Appendix A
+
+Appendix A claimed page size 2 was a different cache format and therefore 32
+was unrepresentable. **That was wrong.** Reading
+`prefill_kernel.cuh:685` more carefully:
+
+```cpp
+static constexpr bool USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2);
+```
+
+`USE_WFP8_ROW_XOR` governs `wfp8_row_xor(wrow)` on the **temporary fp8 weights in
+shared memory** (`:1326-1329`). It does not describe the stored cache. It is an
+optimization flag for one page geometry, not a barrier to adding another.
+
+Adding 32 is exactly the same class of change as the working FlashInfer PR #5121
+backport in `/mnt/nas/alex/models/deepseek-v41-flash-sm120`, which added extra
+pages 128/256 by instantiating the existing kernel:
+
+```cpp
+if (extra_page_block_size == 64)      { DISPATCH_FULLTILE_BY_NH_PBSX(64); }
+else if (extra_page_block_size == 32) { DISPATCH_FULLTILE_BY_NH_PBSX(32); }  // added
+```
+
+Both the full-tile and the length-masked prefill branches needed it, because
+vLLM's dual-cache prefill passes `len(topk) == 128 == BI`, so
+`topk_extra % BI == 0` holds and the **full-tile** branch is the one taken.
+
+## 4.2 Second real bug: finite masked logits
+
+The first page32 build passed startup and served short requests, then failed a
+long-prefill retrieval. Investigating produced a genuine, page-size-independent
+correctness bug in both prefill and decode.
+
+Masking used a large finite value and **then scaled it**:
+
+```cpp
+qk[nt][0] = -1e30f;
+qk[nt][0] *= sm_scale * LOG2E;      // decode_dsv4_kernel.cuh
+```
+
+In prefill the same pattern appears as `float s[4] = {qk[0] * sm_scale_log2e, ...}`
+with `qk[0] = -1e30f`. Multiplying a finite sentinel keeps it finite
+(`-1e30 * scale`), so `max_warp` / `block_max` become that finite value and
+`exp2_fast(0) == 1`. **A fully masked row then produces nonzero attention output
+and a finite LSE instead of exact zero and −inf.**
+
+Fix: mask with `-CUDART_INF_F` (adding `#include <math_constants.h>`; the symbol
+was previously only reachable transitively and `-1e30f` was chosen because it is
+a literal). Negative infinity is invariant under the positive `sm_scale` scaling,
+so masked entries contribute exactly zero. In prefill, the empty-row normalizer
+`(l > 0.f) ? 1/l : 0` then yields exact zeros, and `softmax_lse` yields −1e30, so
+the sink branch becomes `lse = sink_log2`, which is correct.
+
+## 4.3 Measured results
+
+**FlashInfer packed dual-cache validation** —
+`benchmarks/kernels/sm120_dsv41_packed_validation.py`, 192 cases, 288 phases,
+48 CUDA-graph cases, **192 passed / 0 failed**, `known_failure: 0`:
+
+| metric | value |
+|---|---|
+| page32/page64 geometry pairs | 64 / 64 pass |
+| max normalized error | 0.0250 |
+| max absolute error | 0.0339 |
+| max log2 LSE error | 0.0188 |
+| tolerances | `atol=rtol=0.05` (upstream), normalized ≤ 0.05 |
+
+An earlier 2% normalized bound was **too strict**: the unmodified AOT kernel also
+failed it (2.002%–2.503%) on this varied-scale fixture. That was measured, not
+assumed, by re-running the stock artifact via `sparse_mla_sm120.so.before-page32`.
+
+## 4.4 End-to-end status (honest)
+
+With the four geometry fixes plus the FlashInfer patch, the server **reached
+`Application startup complete`** and served real generation:
+
+| request | result |
+|---|---|
+| `17 * 23` | `391`, `finish_reason=stop` |
+| `144 / 12` | `12`, `finish_reason=stop` |
+
+Weight load 313.8 s; KV cache 28.67 GiB; 1,114,653 tokens; 136.07x at 8,192;
+`kv cache group sizes [64]*15 + [8]`; BLHNC layout.
+
+The long-prefill request then exposed a **third** blocker, in the FP8 paged
+indexer:
+
+```
+RuntimeError: Assertion error (.../deepgemm-src/csrc/apis/attention.hpp:484):
+(arch_major == 10 and (block_kv == 32 or 64 or 128)) or
+(arch_major == 9 and (block_kv == 32 or 64)) or
+(arch_major == 12 and ((is_fp4 and (block_kv == 32 or 64)) or
+                       (not is_fp4 and block_kv == 64)))
+```
+
+SM120 was FP8-page-64-only, while the metadata builder accepts 32. Two gates
+(`attention.hpp:484`, `sm120_mqa_logits.hpp:486`) now admit 32. The extension
+**compiles and the assertion no longer fires** — but the numerical oracle for
+this path is **not yet trustworthy**, so this is not a validated fix:
+
+- a low-level check reached the kernel and got finite logits at page32
+  (`logits_shape [2, 128]`, `finite_logits 256`, page used 32) and at page64;
+- but the case matrix fails on my own harness bugs (shape mismatches,
+  normalized error exactly 1.0), **identically at page64 and page32**, so it
+  proves nothing about the patch either way.
+
+Also known: `head_dim=128, num_heads=64, next_n_atom=2` needs 101,380 shared
+bytes against a 101,376 cap (4 bytes over), so that combination still rejects
+safely. Head/atom combinations that fit: 128/64/next_n=1 uses 84,996.
+
+## 4.5 Standing warning
+
+The prefill page32 fix is validated. The **masked-logit fix changed shared
+numerics for every page size**, which is a larger blast radius than the port
+itself; page64 controls pass, but the decode path was exercised only through
+`--enforce-eager` at 8,192 context. Do not describe the port as complete.
+
 ---
 
 # APPENDIX A — DRAFT upstream issue (NOT FILED — user asked to hold)
