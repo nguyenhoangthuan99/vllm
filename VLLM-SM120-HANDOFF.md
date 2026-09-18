@@ -372,6 +372,68 @@ Rebuild on the host (build prerequisites in section 1), then instrument
 One run distinguishes (a) from (b) immediately. Do **not** propose a fix before
 that number is observed; two rounds of static inference have already produced
 wrong answers.
+
+## 2e. THE MECHANISM (verified from FlashInfer source, 2026-09-18)
+
+Recovered from the image layer (survives even with no container running):
+`.../snapshots/13860/fs/usr/local/lib/python3.12/dist-packages/flashinfer/mla/_sparse_mla_sm120.py`
+
+**`page_block_size` is derived PURELY from the KV cache tensor's SHAPE — it is
+not read from any vLLM config value.**
+
+```python
+_BPT_DSV4 = 584          # 448 NoPE + 128 RoPE + 8 fp8 scale, bytes/token
+
+def _packed_kv_page_block_size(kv_cache, *, model_type, name):
+    bytes_per_token = _bytes_per_token_for_model_type(model_type)   # 584 for DSV4
+    if kv_cache.ndim == 2:
+        return int(kv_cache.shape[1]) // bytes_per_token
+    if kv_cache.ndim == 3:
+        if kv_cache.shape[-1] != bytes_per_token: raise ValueError(...)
+        return int(kv_cache.shape[1])
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[-1] != bytes_per_token: raise ValueError(...)
+        if kv_cache.shape[1] == 1: return int(kv_cache.shape[2])   # HND
+        if kv_cache.shape[2] == 1: return int(kv_cache.shape[1])   # NHD
+```
+
+Called at line 329 as `kv_pbs = _packed_kv_page_block_size(kv_cache, ...)` and
+compared at line 335 to `_DECODE_DSV4_PAGE_BLOCK_SIZE` (64).
+
+### Consequence
+`page_block_size=32` means **vLLM handed FlashInfer a cache with 32 tokens per
+block**. For ndim 3/4 that is the block dim read straight off the tensor; for
+ndim 2 it is `18688 // 584 = 32`. Either way it is a **cache-construction**
+property, not a config lookup — which is why every `--block-size` flag we tried
+failed to move it in the expected direction, and why static reasoning about
+`compress_ratio` was the wrong tree to bark up.
+
+### Independent corroboration from the earlier error text
+The `--block-size 256` run reported
+`block stride 460224 != page 74752`. Note `74752 / 584 = 128.0` exactly — so
+that run's *page* really was 128 tokens — while `460224 // 584 = 788 r 32`, i.e.
+the block stride is not a clean multiple of 584 and carries per-block padding.
+That padding is consistent with the packed `fp8_ds_mla` layout and means the
+tensor-shape arithmetic must be done in **bytes**, not tokens.
+
+### What to observe (the measurement, now much more targeted)
+Print the actual tensor vLLM builds, immediately before it reaches FlashInfer:
+
+    from flashinfer.mla._sparse_mla_sm120 import _packed_kv_page_block_size
+    print("SMLADBG kv_cache", self_kv_cache.shape, self_kv_cache.stride(),
+          self_kv_cache.dtype, self_kv_cache.element_size(),
+          "pbs=", _packed_kv_page_block_size(
+                     self_kv_cache.view(torch.uint8) if self_kv_cache.dtype==torch.float8_e4m3fn
+                     else self_kv_cache,
+                     model_type=MODEL_TYPE_DSV4, name="dbg"))
+
+and the same for `swa_kv_cache`. `_as_sparse_cache` (`flashinfer_sparse.py:607`)
+is the function that reshapes/unsqueezes it, so the shape is decided there and
+upstream in the cache manager.
+
+This single print replaces all further static inference. Two rounds of config
+reasoning have already produced wrong answers (section 2d); do not add a third.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
