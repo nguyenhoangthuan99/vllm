@@ -220,3 +220,145 @@ this checkpoint declares `weight_block_size=[32,32]`, so SGLang's `fp8_utils.py`
 gate routes to Triton. SGLang *does* use DeepGEMM for the fp4 indexer. vLLM
 instead maps `[32,32]` UE8M0 to **MXFP8** (`FlashInferCutlassMxfp8LinearKernel`) -
 the same lossless `32x32 -> 1x32` expansion measured in the MXFP8 work here.
+
+---
+
+## Build succeeded; reached CUDA-graph capture; blocked on a page-size mismatch
+
+The full source build (SM120-only, `TORCH_CUDA_ARCHITECTURES=120` -> `12.0f`,
+128 jobs) **completed** and produced the extensions that were missing:
+`_C_stable_libtorch`, `_moe_C_stable_libtorch`, `_qutlass_C`, `cumem_allocator`,
+`fs_io_C`, `spinloop`, `_flashkda_C` (+ `_vllm_fa2_C`/`_vllm_fa3_C`). Verified:
+`sm_120` cubins present, and the 13-arg
+`fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` symbol now exported.
+
+Build prerequisites discovered (each caused a hard failure):
+`git`, `ninja`, `cmake`, `setuptools`/`setuptools-rust`/`setuptools-scm`,
+`libdw-dev` (elfutils/libdwfl.h for DeepGEMM's JIT),
+`libcusparse-dev-13-0` / `libcublas-dev-13-0` / `libcusolver-dev-13-0` /
+`libcurand-dev-13-0` (cusparse.h etc. — the image ships runtime only),
+a `libnvrtc.so` symlink, and a writable source tree.
+
+With the rebuilt extensions the server then got all the way to:
+
+```
+Using FlashInferCutlassMxfp8LinearKernel for MXFP8 GEMM
+Using DeepSeek's fp8_ds_mla KV cache format
+Setting kv cache block size to 128 for FLASHINFER_MLA_SPARSE_DSV41 backend
+Using BLHNC KV cache layout
+Breakable CUDA graph enabled
+Capturing CUDA graphs (PIECEWISE):   0%|          | 0/11
+```
+
+i.e. **CUDA graph capture was actually running on SM120** - the thing
+vllm-project/vllm#56892 said was not possible.
+
+### The wall: page_block_size
+
+```
+RuntimeError: SM120 sparse-MLA has no decode kernel for this shape:
+  num_tokens=8, num_heads=8, topk=128, d_qk=512,
+  page_block_size=32, model_type=1, extra_topk=0
+```
+
+FlashInfer's gate (`flashinfer/mla/_sparse_mla_sm120.py`,
+`_decode_dsv4_dispatchable`) requires four things. Three pass:
+
+| condition | required | actual | ok |
+|---|---|---|---|
+| `num_tokens <= _DECODE_MAX_TOKENS` | 64 | 8 | yes |
+| `d_qk == 512` | 512 | 512 | yes |
+| `(num_heads, topk) in _DECODE_DSV4_DISPATCH` | - | `(8, 128)` present | yes |
+| `page_block_size == _DECODE_DSV4_PAGE_BLOCK_SIZE` | **64** | **32** | **NO** |
+
+Where 32 comes from: `vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py:403`
+(and `:813`) computes
+
+```python
+compressed_block_size = attn_metadata.block_size // self.compress_ratio
+```
+
+The backend declares `get_supported_kernel_block_sizes() -> [128]`, and the log
+confirms 128 was selected, so `128 // compress_ratio == 32` implies
+**`compress_ratio == 4`** was in effect. This checkpoint's `compress_ratios` are
+`{0: 5, 1: 20, 2: 18}` - values 0, 1, 2 only.
+
+So vLLM's SM120 sparse-MLA path divides the KV block size by a compress ratio it
+is resolving to 4, while the checkpoint declares 2, landing on a page size (32)
+that FlashInfer's SM120 kernel does not implement (it wants 64). This is consistent
+with the "DeepSeek V4.1 is a new architecture" observation: the compressed-MLA
+semantics in the checkpoint differ from what this code path assumes.
+
+### Status
+
+Blocker is now a *numerical/architectural* mismatch in the V4.1 sparse-MLA page
+geometry, not a build or environment problem. Options, in order of effort:
+1. Check whether the correct `compress_ratio` for this checkpoint's `model_type`
+   resolves elsewhere (the DSV4.1 vs DSV4 config-convertor path,
+   `vllm/transformers_utils/model_arch_config_convertor.py:89/342`).
+2. Force `--block-size 256` so that `256 // 4 == 64` satisfies FlashInfer - this
+   is a one-line experiment and the cheapest test of the hypothesis.
+3. Ask upstream whether `_DECODE_DSV4_PAGE_BLOCK_SIZE=64` covers this variant.
+
+Option 2 is the immediate next experiment.
+
+---
+
+## Root cause isolated: no valid (block_size, compress_ratio) combination
+
+The runtime resolves `compress_ratio = 4` for this checkpoint, while the checkpoint
+declares `compress_ratios = [0, 1, 2]` (values 0/1/2 only; `index_kpool` is absent,
+so vLLM's `compressor_utils.get_warmup_keys` filters to `>1` -> `{2}`).
+FlashInfer's SM120 sparse-MLA decode then computes
+`page_block_size = manager_block_size // compress_ratio`:
+
+| `--block-size` | compress_ratio | page | FlashInfer SM120 | layout |
+|---|---|---|---|---|
+| 128 | 2 | **64** | OK | manager block cannot split into 2x128 kernel blocks |
+| 128 | 4 | 32 | **FAIL** (`needs 64`) | OK |
+| 256 | 4 | **64** | OK | manager block cannot split into 2x128 kernel blocks |
+
+Measured error messages, both attempts:
+
+```
+--block-size 256, BLHNC:
+  "The resolved KV cache layout (BLHNC) does not store blocks as dense, unpadded
+   pages (block stride 460224 != page 74752), so a manager block cannot be split
+   into 2 kernel blocks of 128 tokens. Reduce --block-size to 128 or set
+   VLLM_KV_CACHE_LAYOUT to a layer-compact layout (e.g. LBNHC)."
+
+--block-size 256, BLNHC:  (same message)
+--block-size 128:         page_block_size=32 ->
+  "SM120 sparse-MLA has no decode kernel for this shape: num_tokens=8,
+   num_heads=8, topk=128, d_qk=512, page_block_size=32"
+```
+
+`VLLM_KV_CACHE_LAYOUT=LBNHC` (as suggested by the first message) is rejected
+outright: `ValueError: LBNHC does not satisfy every supported set; valid
+layouts: ['BLHNC', 'BLNHC']`.
+
+### Notably, vLLM already special-cases this for the controller INDEXER
+
+`vllm/platforms/cuda.py` `_get_indexer_block_alignment`:
+
+```python
+if cls.is_device_capability_family(120):
+    # On sm120 the DeepGEMM paged-MQA kernel only accepts block_kv 64 for the
+    # fp8 indexer cache, so align to the largest pool page here to make the page
+    # split land on 64 not the min 32.
+    page = max(PAGED_MQA_PAGE_SIZES)   # (32, 64) -> 64
+```
+
+So the SM120 `block_kv == 64` requirement is known and handled for the indexer
+cache, but the **sparse-MLA decode** path has the same requirement and is not
+aligned the same way. That is the most likely single point of repair.
+
+### Conclusion
+
+On this checkpoint vLLM's SM120 `FLASHINFER_MLA_SPARSE_DSV41` path has **no
+working (block_size, compress_ratio) combination**: the page size FlashInfer
+requires (64) and the manager-block/kernel-block page splitting are mutually
+exclusive. This is an upstream gap, not a local build or config error.
+
+For reference, SGLang serves this same checkpoint on the same hardware at
+C1 196.8 / C4 396.2 / C16 695.6 / C32 1332.2 tok/s.
