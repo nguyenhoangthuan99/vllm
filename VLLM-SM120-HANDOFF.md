@@ -913,6 +913,69 @@ Note also: `dispatch_dsv4_dual` additionally requires `topk_length_ptr == nullpt
 and `topk_length_extra_ptr == nullptr` — our run satisfies both, so the page size
 is the only failing term.
 
+
+## 2m. SEMANTICS OF {2, 64} SETTLED — 32 has no kernel instantiation
+
+Read from `flashinfer/data/include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh`.
+
+**`PAGE_BLOCK_SIZE` is an index-arithmetic divisor, i.e. a row count per page:**
+
+```cpp
+template <ModelType MT, int PAGE_BLOCK_SIZE>
+__device__ const uint8_t* prefill_kv_entry_base(const uint8_t* kv, int idx,
+                                                size_t stride_kv_block) {
+  const int bi = idx / PAGE_BLOCK_SIZE;   // block index
+  const int li = idx % PAGE_BLOCK_SIZE;   // offset within block
+  return kv_global + bi * stride_kv_block + li * IO_STRIDE;
+}
+```
+
+**`PAGE_BLOCK_SIZE_EXTRA == 2` is a layout flag, not a small page:**
+
+```cpp
+// prefill_kernel.cuh:685
+static constexpr bool USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2);
+```
+
+`USE_WFP8_ROW_XOR` selects `ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>` at
+lines 1347/1428/1471 — a **row-XOR swizzle for the fp8 A-matrix load**, i.e. a
+different on-disk format for the extra cache, not merely a 2-entry page.
+
+### Therefore the accepted set is
+| value | meaning |
+|---|---|
+| **64** | ordinary 64-entry pages (token-paged) |
+| **2** | special 2-row swizzled fp8 layout (`USE_WFP8_ROW_XOR`) |
+
+**There is no instantiation for 32**, which is exactly why the gate is a hard
+`ICHECK` returning `ok = false`.
+
+### Why this is an architectural gap, not a tuning knob
+Our compressed page is `swa_block // compress_ratio = 64 // 2 = 32`, and 32 is
+not representable. The two escape routes both cost something real:
+
+- **Force 64** — requires `swa_block = 128` for ratio-2 layers, but decode
+  requires the SWA page to be 64. Directly contradictory.
+- **Force 2** — requires writing the compressed cache in the row-XOR swizzled
+  fp8 layout, i.e. changing the cache *format* vLLM produces, not a block size.
+
+### What this means for the vLLM port
+Getting DeepSeek-V4.1-Flash fully serving on SM120 via vLLM requires either
+1. upstream SM120 prefill support for a 32-entry compressed page (a new kernel
+   instantiation), or
+2. a v4.1 flattened into the DSV4 ratio geometry the kernel already templates,
+   or
+3. accepting the SGLang path, which already serves this checkpoint on the same
+   hardware.
+
+Decode is solved; prefill for ratio-2 layers is the remaining gap.
+
+### Correction history in this section
+- 2k stated the roles backwards (called 64 the compressed cache).
+- 2l corrected the mapping; **ratio-1 layers are fine** (compressed = 64),
+  only the 18 ratio-2 layers fail prefill.
+- 2m (this section) establishes *why* 32 cannot work: no kernel instantiation.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
