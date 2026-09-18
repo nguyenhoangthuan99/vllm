@@ -665,6 +665,64 @@ for a pure-attention model.
 - `SMLADBG_CACHE` printed two shapes (128 and 64), so more than one cache type
   flows through `_as_sparse_cache`; the 128 one is the indexer's.
 
+
+## 2i. Second blocker has the SAME shape as the first — SM120 falls into an SM100 `else`
+
+Once `block_size=64` cleared the page gate, the run failed in the DeepGEMM
+paged-MQA logits path:
+
+```
+RuntimeError: Assertion error (deepgemm csrc/apis/attention.hpp:409):
+block_kv == 32 or block_kv == 64
+```
+
+### The assert takes a CALLER ARGUMENT, not the kernel constant
+`attention.hpp:394` — `get_paged_mqa_logits_metadata(context_lens, int block_kv,
+num_sms, indices)`. Note `attention.hpp:148` computes a *different*, internal
+`block_kv = sm120::kMqaBlockKv` (= **128**, `sm120_dispatch.hpp:33`) used for
+logits stride. The asserted one is the argument.
+
+vLLM passes `self.kv_cache_spec.num_states` (`indexer.py:1505`), and
+`num_states = block_size // tokens_per_state` (`kv_cache_interface.py:193-196`).
+
+### Root cause: the indexer backend gives SM120 128, not 64
+`vllm/v1/attention/backends/mla/indexer.py:262-263`:
+
+```python
+def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    return [64 if current_platform.is_device_capability_family(90) else 128]
+```
+
+SM90 -> 64, **SM120 -> 128**. The `else` branch is written for SM100. This is
+structurally the same bug as `sparse_mla.py:90` found in section 2b.
+
+Consequence, with `num_states = kernel_block_size // compress_ratio`:
+
+| kernel_block_size | ratio | num_states | assert {32,64} |
+|---|---|---|---|
+| 128 (SM120 today) | 1 (layers 20,24,28,32,36) | **128** | **FAIL** |
+| 128 (SM120 today) | 2 (layers 2,8,14) | 64 | pass |
+| 64 (SM90 today) | 1 | 64 | pass |
+| 64 (SM90 today) | 2 | 32 | pass |
+
+This also explains the two shapes seen in one run — `shape[1]=128` from the
+ratio-1 indexers and `64` from the ratio-2 ones.
+
+Corroborating comment at `indexer.py:252`:
+`# Block sizes count uncompressed tokens: C4 indexer pages hold 64 rows.`
+
+**DeepGEMM already supports 32/64 on SM120** — `attention.hpp:409` asserts
+exactly that under `arch_major == 12`. vLLM is simply not asking for it.
+
+### Applied fix (experiment 2)
+`indexer.py:262` now returns `[64]` for SM120 as well as SM90, with a comment
+citing the DeepGEMM assert. Combined with the section-2h `block_size=64` change,
+both cache classes should satisfy SM120's constraints.
+
+### Caveats
+Same scope limits as 2h: enforce-eager, 8k context, single launch, and the run
+has not yet been shown to reach a working decode.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
