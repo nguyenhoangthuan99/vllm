@@ -723,6 +723,50 @@ both cache classes should satisfy SM120's constraints.
 Same scope limits as 2h: enforce-eager, 8k context, single launch, and the run
 has not yet been shown to reach a working decode.
 
+
+## 2j. Third pass: the block size must agree across the WHOLE KV group
+
+After the indexer change, the run failed with:
+
+```
+RuntimeError: Worker failed with error 'No common block size for 128.'
+```
+
+raised at `vllm/v1/worker/utils.py:386`. The resolver
+(`utils.py:355-387`) requires ONE size accepted by **every backend in the
+group`, because the sparse-MLA and indexer caches share a physical block.
+
+So changing only the indexer was **necessary but not sufficient**: with
+`kv_manager_block_size = 128`, the indexer now wanted 64 while the sparse-MLA
+backend still wanted 128, and no size satisfied both.
+
+### All FOUR sites that must agree
+| file:line | before | after |
+|---|---|---|
+| `deepseek_v41/attention.py:522` `DeepseekV4SWACache(block_size=...)` | 32 | **64** |
+| `deepseek_v41/nvidia/flashinfer_sparse.py:158` (`DeepseekV4FlashInferMLASparseBackend`) | `[128]` | **`[64]` on SM120** |
+| `deepseek_v41/sparse_mla.py:90` (`DeepseekV4SparseMLABackend`) | `[64 if SM90 else 128]` | **`[64]` on SM90+SM120** |
+| `v1/attention/backends/mla/indexer.py:262` (`DeepseekV41IndexerBackend`) | `[64 if SM90 else 128]` | **`[64]` on SM90+SM120** |
+
+### Independent corroboration that 64 is correct
+`vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py:174`
+**`FlashInferMLASparseSM120Backend.get_supported_kernel_block_sizes()` already
+returns `[64, 256]`.** FlashInfer's own SM120 sparse-MLA backend therefore
+declares 64 for exactly the reason the DeepGEMM assert states. The DSv4.1
+backends returning 128 were the anomaly, not our requirement.
+
+### Operational note
+`flashinfer_sparse.py` did not import `current_platform` (only
+`DeviceCapability`); using it there raised `NameError` at worker init. Fixed by
+adding `from vllm.platforms import current_platform`, matching
+`sparse_mla.py:12` and `indexer.py:21`. Worth checking any further edit in that
+file for the same gap.
+
+### Status
+Run relaunched with all four changes. Still **unverified** — the previous three
+attempts each surfaced a new, distinct blocker one layer deeper, so a clean
+result is not yet established.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
