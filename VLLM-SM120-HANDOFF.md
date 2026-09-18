@@ -321,6 +321,64 @@ Weighting a *raw* `sum_i exp(x_i - m_s) v_i` by `exp(lse_s - G)` double-counts
 `l_s` and is off by ~48x at TOPK=512. Verified numerically: variant
 `acc/l`-then-`w` gives 1.56e-07, the raw form 2.45e-01.
 
+
+## 2d. ROOT CAUSE FOUND (2026-09-18): `index_kpool` guard skips the SM120 page-64 alignment
+
+**The `page_block_size=32` is upstream's own SM120 special case failing to engage.**
+
+`vllm/platforms/cuda.py:428` `_get_indexer_block_alignment`:
+
+```python
+index_kpool = getattr(vllm_config.model_config.hf_text_config, "index_kpool", None)
+if not index_kpool or index_kpool <= 1:
+    return None                      # <-- our checkpoint exits HERE
+from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+page = min(PAGED_MQA_PAGE_SIZES)     # (32, 64) -> 32
+if cls.is_device_capability_family(120):
+    # On sm120 the DeepGEMM paged-MQA kernel only accepts block_kv
+    # 64 for the fp8 indexer cache, so align to the largest pool
+    # page here to make the page split land on 64 not the min 32.
+    page = max(PAGED_MQA_PAGE_SIZES) # -> 64
+return index_kpool * page
+```
+
+This checkpoint's `text_config` has **no `index_kpool` key at all**, so the
+function returns `None` at line 433 and the SM120 `max(...) -> 64` branch is
+never reached. The page therefore stays at the minimum pool page **32**, which
+is precisely the `page_block_size=32` in the decode-time failure. The comment
+in upstream's own code names the exact requirement we are missing.
+
+### Why the earlier configs all failed
+- `--block-size 128/256` change the *manager* block, not the indexer
+  alignment; with alignment `None` the split still lands on 32.
+- `LBNHC` is not a valid layout (only `BLHNC`/`BLNHC`).
+- The `block stride != page` error at block-size 256 is downstream of the same
+  missing alignment.
+
+### The minimal fix
+Make SM120 ask for a page of 64 regardless of `index_kpool`. Two candidate
+shapes, both small:
+
+1. Move the `is_device_capability_family(120)` branch **above** the
+   `index_kpool` early return and return 64 when the model is a DSv4 sparse-MLA
+   model; or
+2. Treat a missing `index_kpool` as 1 rather than bailing out, when on SM120.
+
+Option 1 is safer: it cannot change behaviour for models that legitimately have
+no indexer at all.
+
+### Gate status after this
+- `__init__` gate `has_flashinfer_sparse_mla_sm120_config(padded_heads, topk)`:
+  **already passes.** `padded_heads=8` (64 heads / TP8) and
+  `required_topk = window_size = 128` (`_required_sm120_sparse_topk` returns
+  `window_size` when spec is off), and `(8, 128)` IS in `_DECODE_DSV4_DISPATCH`.
+- The only remaining hard blocker is therefore this page-alignment bug.
+
+### Dispatch table note
+`_DECODE_DSV4_DISPATCH` contains `(8, {128,192,256,512,1024})`. Our model's
+`index_topk` is 512, but the *gate* uses `window_size` (128), not `index_topk`
+— for v4.1 the attention windows differ. Worth re-checking once decode runs.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
