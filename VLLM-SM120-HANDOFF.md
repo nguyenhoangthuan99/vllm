@@ -119,7 +119,211 @@ FlashInfer gate — `flashinfer/mla/_sparse_mla_sm120.py::_decode_dsv4_dispatcha
 
 ---
 
-## 3. The open question (UNVERIFIED hypothesis — start here)
+## 2b. RESOLVED 2026-09-18 (after reading the H100 path) — the real cause
+
+**The `// compress_ratio` division is a v4.0-ism. V4.1 does not compress that way.**
+
+Read `vllm/models/deepseek_v41/attention.py:298-308` — the v4.1 attention class
+reads `compress_ratio` **straight from the config, with no `max(1, ...)`, and
+hard-raises unless it is 0, 1 or 2**:
+
+```python
+if compress_ratios is not None and layer_id < len(compress_ratios):
+    self.compress_ratio = int(compress_ratios[layer_id])
+else:
+    self.compress_ratio = 0          # MTP layers past the list = pure SWA
+if self.compress_ratio not in (0, 1, 2):
+    raise ValueError(... "only 0 (sliding window), 1 and 2 are supported.")
+```
+
+Meanwhile `deepseek_v4/attention.py:226` does `self.compress_ratio =
+max(1, config.compress_ratios[layer_id])` — the `max(1, ...)` clamps ratio 0
+(SWA) up to 1. Our checkpoint has **5 ratio-0 layers out of 40**, so under the
+v4.0 class those became `compress_ratio = 1` where v4.1 semantics say *pure
+sliding window, no compressed KV cache at all*.
+
+### Why it produced exactly page_block_size = 32
+
+`sparse_mla.py:90` gives SM120 kernel block size **128** (only SM90 gets 64).
+SM120's FlashInfer decode needs `page_block_size == 64`. So the pass condition is
+`block_size // compress_ratio == 64`, and with `block_size = 128` **only
+`compress_ratio == 2` passes**:
+
+| layer | `compress_ratio` | `128 // ratio` | page 64? | layer count |
+|---|---|---|---|---|
+| ratio-0 SWA (mislabelled as 1 by v4.0 semantics) | 1 | **128** | no | 5 |
+| ratio-1 | 1 | **128** | no | 20 |
+| ratio-2 | 2 | **64** | yes | 18 |
+
+The observed `page_block_size=32` is the *other* half of the same bug: when the
+`128 // 1 = 128` page is rejected, the pool falls back to the `PAGED_MQA_PAGE_SIZES`
+minimum (32) and the split lands on 32 instead of 64.
+
+**So: this is a compress-ratio-semantics bug, not a page-arithmetic bug.** My
+"something halves 128 → 64" hypothesis below was wrong — nothing halves it; the
+ratio itself is wrong, and 128//1 ≠ 64.
+
+### Independently, C2A geometry is FULLY derivable — no reference implementation needed
+
+`vllm/models/deepseek_v41/common/ops/cache_utils.py:956` (inside
+`CombineTopkSwaIndicesKernel.kernel`) already encodes the exact v4.1 index
+geometry, parameterized by constexpr `COMPRESS_RATIO` and `WINDOW_SIZE`:
+
+```python
+# the indexer emits min((pos + 1) // compress_ratio, topk_tokens) valid entries
+if COMPRESS_RATIO > 0:
+    topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+else:
+    topk_len = 0     # SWA-only: TOP_K=0, skip the division (div by 0 is UB)
+swa_start = tl.maximum(pos - (WINDOW_SIZE - 1), 0)
+swa_len   = pos - swa_start + 1
+```
+
+with `WINDOW_SIZE` = `config.sliding_window` = **128** (checkpoint
+`text_config.sliding_window = 128`), warmup keys generated per layer type at
+`cache_utils.py:1041`, and `combine_topk_swa_indices` called from all three
+backends (`flashmla.py:349`, `flash_mla_mega_attn.py:449`, `amd/rocm.py:882`).
+
+This kernel is **already generic across ratios 0/1/2/4/128** and runs on any
+vendor. It is the authoritative reference for any SM120 sparse-decode kernel
+(Triton or CUTLASS) that has to produce the same index/lens fabrication and the
+same `topk_len = min((pos+1)//ratio, index_topk)` validity rule.
+
+### Consequence for the SM120 work
+
+1. The **blocking** bug is the v4.0/v4.1 compress-ratio mis-selection plus the
+   SM120 page-split fallback — both upstream-of-kernel, both small.
+2. Once fixed, only the **ratio-2 and ratio-1** layers are in play; ratio-0
+   layers take a pure sliding-window path with no compressed gather.
+3. A new SM120 sparse-decode kernel must satisfy `block_size // ratio == 64`,
+   i.e. accept a compressed page of 64 tokens, and honour
+   `topk_len = min((pos+1)//ratio, index_topk)` with `index_topk = 512`.
+4. `compress_ratio == 4` and `== 128` never occur for this checkpoint — do not
+   build C4A/C128A geometry for it.
+
+
+## 2c. FlashInfer's actual SM120 contract (read from the image, 2026-09-18)
+
+Source recovered from the containerd snapshot (builder container deleted but the
+image layer survives):
+`.../snapshots/13860/fs/usr/local/lib/python3.12/dist-packages/flashinfer/mla/_sparse_mla_sm120.py`
+(1361 lines). Constants mirrored from
+`include/flashinfer/attention/sparse_mla_sm120/{arch,model}/*.cuh`.
+
+```python
+_D_V    = 512    # universal across DSV3_2 and DSV4
+_BI     = 64     # KV partition tile in candidates (BLOCK_SIZE_N)
+_DECODE_MAX_TOKENS = 64          # > 64 routes to the prefill orchestrator
+_DECODE_DSV4_PAGE_BLOCK_SIZE = 64
+_DECODE_DSV4_DISPATCH = {(H, topk) for H in (8,16,32,64,128)
+                                     for topk in (128,192,256,512,1024)}
+```
+
+`_decode_dsv4_dispatchable` = `num_tokens <= 64` AND `d_qk == 512` AND
+`page_block_size == 64` AND `(num_heads, topk) in _DECODE_DSV4_DISPATCH`.
+Our failure was purely the `page_block_size` term (32 != 64).
+
+**Design facts a replacement kernel must honour:**
+- Decode is **split-K over the topk dimension**: `num_splits = ceil(topk/_BI)`,
+  i.e. `ceil(512/64) = 8` splits, with a separate merge kernel combining
+  per-split partial outputs. Caller-supplied scratch:
+  `mid_out [T,H,num_splits,512] bf16`, `mid_lse [T,H,num_splits] fp32`.
+  This is why a naive one-program-per-(token,head) Triton kernel is slow —
+  it uses 64 programs where the shape supports 8x more parallelism.
+- `extra_topk` is a **separate second region**: `num_splits_main +
+  num_splits_extra`; the main set uses `kv_cache`/`indices`/`topk_length`, the
+  extra set uses `extra_kv_cache`/`extra_indices`/`extra_topk_length`. This is
+  the SWA + compressed two-source structure.
+- **Head padding**: `HPB = 16`; the kernel pads the head tile to 16 with
+  zero-Q rows and gates writes by `NUM_HEADS`. TP8 -> 8 heads -> pad to 16.
+- `D_V` is universally 512; `output` last dim must be 512; `out_lse` is a
+  separate fp32 output.
+- Supported compute capability via `supported_compute_capability`; model_type
+  distinguishes DSV4 vs DSV3_2 (topk 2048 / d_qk 576 for 3_2).
+
+### Triton reference written and validated (uncommitted -> now committed)
+`vllm/models/deepseek_v41/nvidia/sparse_mla_sm120_triton.py`
+(plus sweep variant `_smla_sm120_sweep.py`).
+
+Validated against a dense torch reference, rel-L2:
+| case | rel-L2 |
+|---|---|
+| ratio1, index_topk=512 | 3.80e-08 |
+| ratio2, index_topk=512 | 2.26e-07 |
+| ratio0 (SWA-only) | 0.0 |
+| pos=65535, ratio2 | 2.26e-07 |
+| all rows topk_len==0 | 0.0 (exact zeros, no +inf LSE) |
+| topk_len > pool (repeats) | 1.50e-07 |
+| duplicate-slot accumulation vs closed form | 6.65e-08 |
+
+Perf (T x H programs, BLOCK_TOPK sweep, TOPK=512, d=512, SM120, 188 SMs):
+BLOCK_TOPK 64 is the sweet spot at ~68 us/call for T=8,H=8.
+T=1: 87.7us, T=8: 85.6us, T=64: 128.8us (one-program-per-(token,head) version).
+Grid at T=8,H=8 is 64 programs on 188 SMs = 34% occupancy — the reason it is
+slow, and exactly what FlashInfer's `_BI=64` split-K solves.
+
+
+### Triton kernels committed
+
+| file | role |
+|---|---|
+| `vllm/models/deepseek_v41/nvidia/sparse_mla_sm120_triton.py` | readable reference: one program per (token, head), online softmax |
+| `vllm/models/deepseek_v41/nvidia/sparse_mla_sm120_split.py` | split-K form matching FlashInfer's `_BI=64` contract |
+
+Both are pure torch+triton (no vllm import needed for testing) and are
+validated against a dense torch reference.
+
+**Correctness (final, 10 cases, split-K and 1-program both vs torch reference):**
+
+| case | split-K rel-L2 | 1-prog rel-L2 |
+|---|---|---|
+| T=1 H=8 TOPK=512 ratio2 | 0.0 | 0.0 |
+| T=8 H=8 TOPK=512 ratio2 | 2.00e-07 | 1.62e-07 |
+| T=16 H=8 TOPK=512 ratio2 | 2.37e-07 | 1.87e-07 |
+| T=4 H=8 TOPK=512 ratio1 | 3.08e-08 | 2.41e-08 |
+| T=8 H=8 TOPK=512 ratio0 (SWA-only) | 0.0 | 0.0 |
+| T=8 H=8 TOPK=128 ratio2 | 2.24e-07 | 1.64e-07 |
+| T=64 H=8 TOPK=512 ratio2 | 2.66e-07 | 2.08e-07 |
+| T=32 H=16 TOPK=512 ratio2 | 2.45e-07 | 1.96e-07 |
+| T=64 H=16 TOPK=1024 ratio2 | 2.60e-07 | 2.23e-07 |
+| T=128 H=8 TOPK=512 ratio2 | 2.68e-07 | 2.13e-07 |
+
+All at the bf16 accuracy floor. Empty rows (`topk_len == 0`) return exact zeros
+and a `-inf` LSE — no nan, unlike the all-masked-row `+inf` LSE defect seen in
+stock FlashInfer 0.6.18.
+
+**Performance (SM120, 188 SMs, TOPK=512, d_qk=d_v=512, H=8, pool 131072):**
+
+| T | 1-prog us | split-K us | speedup |
+|---|---|---|---|
+| 1 | 87.1 | 159.6 | 0.55x |
+| 2 | 86.3 | 146.6 | 0.59x |
+| 4 | 85.4 | 104.1 | 0.82x |
+| 8 | 85.2 | 63.1 | **1.35x** |
+| 16 | 86.8 | 60.8 | **1.43x** |
+| 32 | 105.5 | 59.0 | **1.79x** |
+| 64 | 122.8 | 90.3 | 1.36x |
+
+Split-K wins for T >= 8 (the real decode regime, since `_DECODE_MAX_TOKENS`
+is 64 and continuous batching typically runs 8-64 tokens/step). It loses at
+T < 8 where the second launch dominates — a dispatcher should pick per batch.
+
+`BLOCK_TOPK` sweep at T=16 (all correct): 32 -> 166.7us, **64 -> 150.8us (best)**,
+128 -> 154.9us, 256 -> 202.7us, 512 -> 472.0us. 64 matches FlashInfer's `_BI`.
+
+**Merge derivation (three wrong attempts, recorded so it is not redone):**
+split partials must be normalized by their own `l_s` and merged as a plain
+LSE-weighted average:
+```
+out = sum_s exp(lse_s - G) * (acc_s / l_s) / sum_s exp(lse_s - G)
+```
+Weighting a *raw* `sum_i exp(x_i - m_s) v_i` by `exp(lse_s - G)` double-counts
+`l_s` and is off by ~48x at TOPK=512. Verified numerically: variant
+`acc/l`-then-`w` gives 1.56e-07, the raw form 2.45e-01.
+
+---
+
+## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
 
 **Arithmetic says it should work:** SM120 declares
 `get_supported_kernel_block_sizes() -> [128]`
