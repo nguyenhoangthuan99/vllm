@@ -499,6 +499,30 @@ Per-layer-type dispatch. C2A layers (page 64) can go to FlashInfer; C1A layers
 
 This is a modelling decision to make with the user, not something to guess at.
 
+
+### Verification: the Triton kernels are page-size agnostic (measured)
+
+The claim in 2f — that these kernels can cover the C1A (page-128) layers that
+FlashInfer rejects — was tested rather than asserted. Neither kernel takes a
+page size: both consume **flat global slot indices**. Feeding the same logical
+slots through four different block->slot translations gives bit-identical
+results:
+
+| page | split-K rel-L2 | 1-prog rel-L2 |
+|---|---|---|
+| 32 | 2.785e-07 | 2.202e-07 |
+| 64 | 2.785e-07 | 2.202e-07 |
+| 128 | 2.785e-07 | 2.202e-07 |
+| 256 | 2.785e-07 | 2.202e-07 |
+
+(`_BI = 64` in the split kernel is the **topk split tile**, unrelated to the KV
+page size — do not confuse the two.)
+
+### Erratum
+Commit `fb89f90a1`'s subject line reads "the KV cache tank shape"; it should read
+"tensor shape". Cosmetic only, but the commit is already published so the
+subject is not being rewritten; the message itself is correct.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
