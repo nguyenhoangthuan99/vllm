@@ -1166,6 +1166,74 @@ agreement with FP32 accumulation.
 * The masked-logit fix from section 4.2 remains the larger-blast-radius change
   and still warrants scrutiny beyond the eager 8,192-context runs.
 
+
+---
+
+# SECTION 6 — CUDA GRAPHS AT 64K: CAPTURES, THEN DIES. NOT THE ATTENTION PORT.
+
+Measured 2026-09-18. `--no-enforce-eager --compilation-config
+{"cudagraph_mode":"PIECEWISE"}`, `--max-model-len 65536`, port 30101.
+
+## 6.1 What worked
+
+* **Startup completed** and **51/51 CUDA graphs captured** (0.57 GiB CUDAGraph
+  memory; peak activation 3.68 GiB). KV cache 26.59 GiB, slightly below the
+  eager 28.67 GiB.
+* Nothing in the page-32 prefill, masked-logit, or indexer changes blocked
+  capture. Graph capture exercises the real kernels, so this is meaningful.
+
+## 6.2 What failed
+
+Every request returned **empty output with `finish_reason=length`** — no text at
+any `max_tokens` (1, 2, 8, 64), on both `/v1/chat/completions` and
+`/v1/completions`. Identical prompts that produced `391` and `12` under eager
+produced mojibake or nothing. The engine then died:
+
+```
+RuntimeError: NCCL error: unhandled cuda error (run with NCCL_DEBUG=INFO)
+terminate called after throwing an instance of 'c10::AcceleratorError'
+  what():  CUDA error: an illegal memory access was encountered
+```
+
+Note the NCCL errors are **secondary**: the illegal access poisoned the CUDA
+context, and the next collective surfaced it.
+
+## 6.3 Root cause — a real bug, but NOT in the port
+
+The first failure to surface is a Triton kernel compiled **during inference**:
+
+```
+WARNING [jit_monitor.py:140] Triton kernel JIT compilation during inference:
+_ring_slot_mapping_kernel. ... consider extending warmup to cover this shape.
+```
+
+`_ring_slot_mapping_kernel` lives in
+`vllm/models/deepseek_v41/compressor.py:61` — the V4.1 **compressor** path, not
+the attention port touched by this work. Two facts line up:
+
+1. It compiles lazily **at first request**, i.e. **outside** graph capture, so
+   the captured graphs replay against a kernel/shape the warmup did not cover.
+2. `CompressorMetadataBuilder._cudagraph_support = AttentionCGSupport.ALWAYS`
+   claims unconditional graph safety, while `CompressorStateCache.block_size`
+   is computed as `max(8, 1 << (rows_per_step - 1).bit_length())` from
+   `num_speculative_tokens + 2` — i.e. a per-model ring capacity, independent
+   of the attention geometry changed here.
+
+So the honest attribution: **the V4.1 compressor ring-slot metadata path is not
+graph-safe in this configuration**, and it is not part of what was ported.
+
+**Not established:** whether the illegal access is ultimately inside
+`_ring_slot_mapping_kernel` itself, or whether that kernel merely ran first and
+the async fault is reported at the next sync. The stack shows the fault
+surfacing at `Triton Error [CUDA]` and again at an `all_reduce`, consistent with
+async reporting. Confirming needs `CUDA_LAUNCH_BLOCKING=1` — not done.
+
+## 6.4 Consequence
+
+**Eager at 8,192 is the validated configuration and is untouched by this.**
+CUDA graphs remain unvalidated; do not enable them for this checkpoint yet.
+Also still unmeasured: contexts between 8,192 and 65,536, and throughput.
+
 ---
 
 # APPENDIX A — DRAFT upstream issue (NOT FILED — user asked to hold)
