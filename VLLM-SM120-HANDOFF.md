@@ -850,6 +850,69 @@ either
 
 Still **not serving**. `--enforce-eager`, 8k context, single launch throughout.
 
+
+## 2l. CORRECTION to 2k + the precise conflict
+
+**2k had the two caches reversed. Corrected here.**
+
+Verified from the FlashInfer JIT source (`sparse_mla_sm120.cu:175-190` and
+`:225-232`):
+
+| error field | parsed from | in vLLM's call |
+|---|---|---|
+| `page_block_size` | `kv_cache` | `swa_kv_paged` = `_as_sparse_cache(swa_k_cache)` |
+| `extra_page_block_size` | `extra_kv_cache` | `extra_kv_paged` = `_as_sparse_cache(compressed_k_cache)` |
+
+and the wiring is at `deepseek_v41/nvidia/flashinfer_sparse.py:964,970`:
+```python
+swa_kv_paged  = self._as_sparse_cache(swa_k_cache)          # -> kv_cache
+extra_kv_paged = self._as_sparse_cache(compressed_k_cache)  # -> extra_kv_cache
+```
+
+So our error reads:
+- `page_block_size=64` = the **SWA** cache — correct after the fix
+- `extra_page_block_size=32` = the **COMPRESSED** cache — the blocker
+
+(2k said the opposite. The 32 is the *compressed* page, not the SWA page.)
+
+### Why the compressed page is exactly 32
+`flashinfer_sparse.py:947` — `block_size = attn_metadata.block_size // self.compress_ratio`.
+With the new SWA block of 64 and `compress_ratio = 2`: `64 // 2 = 32`, matching
+the observed value exactly.
+
+### The conflict is real and per-layer-type
+`compressed_page = swa_block / ratio`:
+
+| SWA block | ratio | compressed page | prefill (needs 2 or 64) | decode (needs 64) |
+|---|---|---|---|---|
+| 64 | **1** | **64** | **OK** | **OK** |
+| 64 | **2** | **32** | **FAIL** | OK |
+| 128 | 1 | 128 | FAIL | FAIL |
+| 128 | 2 | 64 | OK | FAIL |
+
+**No single SWA block satisfies both gates.** `64` is forced by decode; it then
+makes ratio-2 compressed pages 32, which prefill rejects.
+
+**Important nuance:** ratio-1 layers are entirely fine (compressed = 64). Only
+the **ratio-2 layers** (18 of 40, incl. 3 of 8 index sources) break prefill. So
+this is not a whole-model failure but a per-layer-type one — which suggests the
+resolution may be per-layer rather than a single global block size.
+
+This is precisely the v4.1-vs-v4.0 architectural difference the user identified:
+the DSV4 dual-prefill kernel's accepted `extra_page_block_size` set is `{2, 64}`,
+and v4.1's ratio-2 geometry naturally produces 32.
+
+### Open question for the next step
+`2` is an accepted value. It corresponds to a *compressed* page of 2 states,
+i.e. `swa_block // ratio` with a much smaller block — or a different unit
+entirely (states rather than tokens). Determining whether v4.1 is meant to pass
+a *state* count rather than a token count here would decide between
+"rescale the page" and "pass a different quantity".
+
+Note also: `dispatch_dsv4_dual` additionally requires `topk_length_ptr == nullptr`
+and `topk_length_extra_ptr == nullptr` — our run satisfies both, so the page size
+is the only failing term.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
