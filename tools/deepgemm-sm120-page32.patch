@@ -1,0 +1,22 @@
+--- a/csrc/apis/attention.hpp
++++ b/csrc/apis/attention.hpp
+@@ -484,7 +484,7 @@
+     DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
+                    (arch_major == 9 and (block_kv == 32 or block_kv == 64)) or
+                    (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64)) or
+-                                          (not is_fp4 and block_kv == 64))));
++                                          (not is_fp4 and (block_kv == 32 or block_kv == 64)))));
+     const int kv_head_dim = is_fp4 ? head_dim / 2 : head_dim;
+     const int sf_bytes = static_cast<int>(is_mx_sf ? sizeof(int) : sizeof(float));
+     DG_HOST_ASSERT(num_heads_kv == 1 and head_dim_with_sf == kv_head_dim + sf_bytes);
+--- a/csrc/jit_kernels/impls/sm120_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/sm120_mqa_logits.hpp
+@@ -483,7 +483,7 @@
+     const int num_groups = split_kv / block_kv;
+     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+-    DG_HOST_ASSERT(block_kv == 64);
++    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
+ 
+     const auto tensor_map_q = make_tma_2d_desc(

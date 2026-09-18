@@ -1,0 +1,214 @@
+--- a/decode_dsv4_kernel.cuh
++++ b/decode_dsv4_kernel.cuh
+@@ -4,6 +4,8 @@
+ // (license header — full text mirrors the other files in this directory)
+ 
+ #pragma once
++
++#include <math_constants.h>
+ 
+ #include "arch/barrier.cuh"
+ #include "arch/cp_async.cuh"
+@@ -443,12 +445,12 @@
+       const int idx0 = (abs_c0 < section_len) ? section_idx_base[abs_c0] : -1;
+       const int idx1 = (abs_c1 < section_len) ? section_idx_base[abs_c1] : -1;
+       if (abs_c0 >= split_cand_end || idx0 < 0) {
+-        qk[nt][0] = -1e30f;
+-        qk[nt][2] = -1e30f;
++        qk[nt][0] = -CUDART_INF_F;
++        qk[nt][2] = -CUDART_INF_F;
+       }
+       if (abs_c1 >= split_cand_end || idx1 < 0) {
+-        qk[nt][1] = -1e30f;
+-        qk[nt][3] = -1e30f;
++        qk[nt][1] = -CUDART_INF_F;
++        qk[nt][3] = -CUDART_INF_F;
+       }
+       qk[nt][0] *= sm_scale * LOG2E;
+       qk[nt][1] *= sm_scale * LOG2E;
+@@ -529,13 +531,8 @@
+     //     global_sum update.
+     //   warp_rescale  = exp(local_max[w] - new_gmax) — rescales THIS
+     //     warp's p (computed in the warp's own local_max frame) into the
+-    //     new global frame. CRITICAL for correctness when a warp covers
+-    //     only invalid candidates: the post-mask qk == -1e30 * sm_scale *
+-    //     LOG2E ≈ -6.38e28 becomes the warp's local_max[0], and softmax
+-    //     gives p ≡ 1 (exp2(qk - local_max) = exp2(0)). Without the
+-    //     per-warp factor, these spurious 1s would leak into sm_p_full
+-    //     and corrupt the RoPE MMA. The exp(local_max - new_gmax) factor
+-    //     drives them to ~0.
++    //     new global frame. Masked logits are -inf, so even an entirely
++    //     invalid warp contributes exactly zero mass.
+     const float block_rescale0 = exp2f(block_local_max0 - new_gmax0);
+     const float block_rescale1 = exp2f(block_local_max1 - new_gmax1);
+     const float warp_rescale0 = exp2f(local_max[0] - new_gmax0);
+--- a/prefill_kernel.cuh
++++ b/prefill_kernel.cuh
+@@ -28,6 +28,8 @@
+ 
+ #pragma once
+ 
++#include <math_constants.h>
++
+ #include "arch/barrier.cuh"
+ #include "arch/common.cuh"
+ #include "arch/cp_async.cuh"
+@@ -298,22 +300,22 @@
+       {
+         int e0 = qk_nb + tid * 2, e1 = e0 + 1;
+         if (ib[e0] < 0) {
+-          qk[0] = -1e30f;
+-          qk[2] = -1e30f;
++          qk[0] = -CUDART_INF_F;
++          qk[2] = -CUDART_INF_F;
+         }
+         if (ib[e1] < 0) {
+-          qk[1] = -1e30f;
+-          qk[3] = -1e30f;
++          qk[1] = -CUDART_INF_F;
++          qk[3] = -CUDART_INF_F;
+         }
+         if (cold.topk_length != nullptr) {
+           int a0 = ti * BI + e0, a1 = ti * BI + e1;
+           if (a0 >= topk_len) {
+-            qk[0] = -1e30f;
+-            qk[2] = -1e30f;
++            qk[0] = -CUDART_INF_F;
++            qk[2] = -CUDART_INF_F;
+           }
+           if (a1 >= topk_len) {
+-            qk[1] = -1e30f;
+-            qk[3] = -1e30f;
++            qk[1] = -CUDART_INF_F;
++            qk[3] = -CUDART_INF_F;
+           }
+         }
+       }
+@@ -1000,47 +1002,47 @@
+           {
+             int e0 = qk_nb + tid * 2, e1 = e0 + 1;
+             if (ib[e0] < 0) {
+-              qk[0] = -1e30f;
+-              qk[2] = -1e30f;
++              qk[0] = -CUDART_INF_F;
++              qk[2] = -CUDART_INF_F;
+             }
+             if (ib[e1] < 0) {
+-              qk[1] = -1e30f;
+-              qk[3] = -1e30f;
++              qk[1] = -CUDART_INF_F;
++              qk[3] = -CUDART_INF_F;
+             }
+             if constexpr (DUAL_CACHE && !ASSUME_FULL_TILES) {
+               if (is_main) {
+                 if (cold.topk_length != nullptr) {
+                   int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                   if (a0 >= topk_len) {
+-                    qk[0] = -1e30f;
+-                    qk[2] = -1e30f;
++                    qk[0] = -CUDART_INF_F;
++                    qk[2] = -CUDART_INF_F;
+                   }
+                   if (a1 >= topk_len) {
+-                    qk[1] = -1e30f;
+-                    qk[3] = -1e30f;
++                    qk[1] = -CUDART_INF_F;
++                    qk[3] = -CUDART_INF_F;
+                   }
+                 }
+               } else {
+                 int a0 = (ti - main_ni) * BI + e0, a1 = (ti - main_ni) * BI + e1;
+                 if (a0 >= topk_len_extra) {
+-                  qk[0] = -1e30f;
+-                  qk[2] = -1e30f;
++                  qk[0] = -CUDART_INF_F;
++                  qk[2] = -CUDART_INF_F;
+                 }
+                 if (a1 >= topk_len_extra) {
+-                  qk[1] = -1e30f;
+-                  qk[3] = -1e30f;
++                  qk[1] = -CUDART_INF_F;
++                  qk[3] = -CUDART_INF_F;
+                 }
+               }
+             } else if constexpr (!DUAL_CACHE && !ASSUME_FULL_TILES) {
+               if (cold.topk_length != nullptr) {
+                 int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                 if (a0 >= topk_len) {
+-                  qk[0] = -1e30f;
+-                  qk[2] = -1e30f;
++                  qk[0] = -CUDART_INF_F;
++                  qk[2] = -CUDART_INF_F;
+                 }
+                 if (a1 >= topk_len) {
+-                  qk[1] = -1e30f;
+-                  qk[3] = -1e30f;
++                  qk[1] = -CUDART_INF_F;
++                  qk[3] = -CUDART_INF_F;
+                 }
+               }
+             }
+@@ -1146,47 +1148,47 @@
+           {
+             int e0 = qk_nb + tid * 2, e1 = e0 + 1;
+             if (ib[e0] < 0) {
+-              qk[0] = -1e30f;
+-              qk[2] = -1e30f;
++              qk[0] = -CUDART_INF_F;
++              qk[2] = -CUDART_INF_F;
+             }
+             if (ib[e1] < 0) {
+-              qk[1] = -1e30f;
+-              qk[3] = -1e30f;
++              qk[1] = -CUDART_INF_F;
++              qk[3] = -CUDART_INF_F;
+             }
+             if constexpr (DUAL_CACHE && !ASSUME_FULL_TILES) {
+               if (is_main) {
+                 if (cold.topk_length != nullptr) {
+                   int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                   if (a0 >= topk_len) {
+-                    qk[0] = -1e30f;
+-                    qk[2] = -1e30f;
++                    qk[0] = -CUDART_INF_F;
++                    qk[2] = -CUDART_INF_F;
+                   }
+                   if (a1 >= topk_len) {
+-                    qk[1] = -1e30f;
+-                    qk[3] = -1e30f;
++                    qk[1] = -CUDART_INF_F;
++                    qk[3] = -CUDART_INF_F;
+                   }
+                 }
+               } else {
+                 int a0 = (ti - main_ni) * BI + e0, a1 = (ti - main_ni) * BI + e1;
+                 if (a0 >= topk_len_extra) {
+-                  qk[0] = -1e30f;
+-                  qk[2] = -1e30f;
++                  qk[0] = -CUDART_INF_F;
++                  qk[2] = -CUDART_INF_F;
+                 }
+                 if (a1 >= topk_len_extra) {
+-                  qk[1] = -1e30f;
+-                  qk[3] = -1e30f;
++                  qk[1] = -CUDART_INF_F;
++                  qk[3] = -CUDART_INF_F;
+                 }
+               }
+             } else if constexpr (!DUAL_CACHE && !ASSUME_FULL_TILES) {
+               if (cold.topk_length != nullptr) {
+                 int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                 if (a0 >= topk_len) {
+-                  qk[0] = -1e30f;
+-                  qk[2] = -1e30f;
++                  qk[0] = -CUDART_INF_F;
++                  qk[2] = -CUDART_INF_F;
+                 }
+                 if (a1 >= topk_len) {
+-                  qk[1] = -1e30f;
+-                  qk[3] = -1e30f;
++                  qk[1] = -CUDART_INF_F;
++                  qk[3] = -CUDART_INF_F;
+                 }
+               }
+             }

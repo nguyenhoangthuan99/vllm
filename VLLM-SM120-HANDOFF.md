@@ -1102,6 +1102,70 @@ numerics for every page size**, which is a larger blast radius than the port
 itself; page64 controls pass, but the decode path was exercised only through
 `--enforce-eager` at 8,192 context. Do not describe the port as complete.
 
+
+---
+
+# SECTION 5 — FP8 PAGED INDEXER AT PAGE 32: VALIDATED
+
+Supersedes the "unvalidated" caveat in section 4.4. The gate change is now
+measured, not merely assumed.
+
+## 5.1 What was actually wrong in the earlier attempt
+
+Two separate things, and neither was the kernel:
+
+1. **A second admission gate.** `attention.hpp:409`, inside
+   `get_paged_mqa_logits_metadata`, has its **own** SM120 check
+   (`block_kv == 32 or block_kv == 64`) distinct from the logits gate at
+   `:484`. Probing with `block_kv == 16` there produces exactly the failure the
+   server logged, which is how the second gate was identified.
+2. **A hand-rolled oracle.** Five successive harness bugs (CPU tensors passed
+   to a CUDA `randn`, a CPU generator handed to `randperm` on a CUDA tensor,
+   einsum output axis order, and a wrong region model). Re-deriving the
+   semantics was the mistake; DeepGEMM's own
+   `tests/test_attention.py:ref_paged_mqa_logits` already defines them.
+
+## 5.2 What the kernel actually does, per the reference
+
+* `context_lens[i]` is the request length and **all** `next_n` queries score the
+  same final position (`q_offsets = [context_len] * next_n`), masked to
+  `k_offsets < context_len`.
+* The FP8 page is `[block_size * head_dim]` values **then**
+  `block_size * 4` bytes of per-token FP32 scales — one contiguous scale
+  region, not interleaved per-token records.
+* `block_kv` is **bytes of KV per page**, not a token count. A 32-token page at
+  head_dim 128 is `block_kv = 32`; the `group = 128 / block_kv` split is the
+  kernel's own concept.
+
+## 5.3 Measured results
+
+`benchmarks/kernels/sm120_paged_indexer_validation.py`, 10 cases, greedy, no
+known-failure waivers — **10/10 pass**:
+
+| case group | pages under test | max normalized error |
+|---|---|---|
+| `g1` (64-token store block) | page 64 | 1.07e-7 |
+| `g2` (32-state region, ratio-2 shape) | **page 32** | **1.14e-7** |
+
+Covered: batch 1/2/3, context 128/256/512/1024, `next_n` 1/2/3, shuffled block
+tables, 8448-byte padded physical strides, 9 distinct scale exponents, and
+`cache_strides == [8448, 132, 132, 1]` at both page sizes.
+
+The oracle decodes values back from **the packed bytes** rather than
+recomputing from pre-quantization inputs (which is what the upstream reference
+does and which would hide FP8 roundoff). Errors at ~1e-7 indicate near-exact
+agreement with FP32 accumulation.
+
+## 5.4 Honest limits of this evidence
+
+* It validates the **logits kernel at page 32**, not the whole indexer stack.
+  The top-k selection and the sparse-attention consumer are not covered here.
+* `head_dim=128, num_heads=64, next_n_atom=2` still needs 101,380 shared bytes
+  against a 101,376 cap, so that combination still rejects safely. Current
+  accessor heads (32) are unaffected.
+* The masked-logit fix from section 4.2 remains the larger-blast-radius change
+  and still warrants scrutiny beyond the eager 8,192-context runs.
+
 ---
 
 # APPENDIX A — DRAFT upstream issue (NOT FILED — user asked to hold)
