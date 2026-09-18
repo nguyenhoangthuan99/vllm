@@ -976,6 +976,160 @@ Decode is solved; prefill for ratio-2 layers is the remaining gap.
   only the 18 ratio-2 layers fail prefill.
 - 2m (this section) establishes *why* 32 cannot work: no kernel instantiation.
 
+
+---
+
+# APPENDIX A — DRAFT upstream issue (NOT FILED — user asked to hold)
+
+Status: **do not file.** Written for later use. Every claim below is backed by
+the measurements in sections 2g–2m; file:line references were verified against
+the built tree and the FlashInfer image layer.
+
+---
+
+**Title (draft):** `[Bug] DeepSeek-V4.1-Flash cannot use FLASHINFER_MLA_SPARSE on
+SM120: ratio-2 layers compute a 32-entry compressed page, which
+dispatch_dsv4_dual has no instantiation for`
+
+**Hardware/software**
+- 8x NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120), CUDA 13.0
+- vLLM built from source, `TORCH_CUDA_ARCHITECTURES=120`
+- FlashInfer 0.6.18 (as shipped in the image)
+- Checkpoint: DeepSeek-V4.1-Flash, `model_type=deepseek_v41`,
+  `compress_ratios=[0,1,2]`, `index_topk=512`, 40 hidden layers
+
+**Summary**
+
+`FLASHINFER_MLA_SPARSE_DSV41` on SM120 requires several block-size values to be
+64 rather than 128, and even after aligning all of them, prefill for
+`compress_ratio == 2` layers fails because the compressed page computes to 32
+entries, which `dispatch_dsv4_dual` does not instantiate.
+
+**Finding 1 — decode page gate (worked around)**
+`_decode_dsv4_dispatchable` requires `page_block_size ==
+_DECODE_DSV4_PAGE_BLOCK_SIZE` (== 64). The SM120 backend chain returned 128, and
+the SWA cache was built with an explicit `block_size=32`
+(`vllm/models/deepseek_v41/attention.py:522`) even though
+`DeepseekV4SWACache`'s default is 64 (`v1/attention/backends/mla/sparse_swa.py:83`).
+
+Setting these to 64 produced, for the first time,
+`[AutoTuner]: Tuning sparse_mla_sm120_decode_dsv4: 100%|21/21` and removed
+`SM120 sparse-MLA has no decode kernel for this shape`. Measured tensor went from
+`shape=(..., 32, 1, 584)` to `shape=(..., 64, 1, 584)`.
+
+**Finding 2 — DeepGEMM indexer assert (worked around)**
+```
+RuntimeError: Assertion error (deepgemm csrc/apis/attention.hpp:409):
+block_kv == 32 or block_kv == 64
+```
+That `block_kv` is the **caller argument** to
+`get_paged_mqa_logits_metadata(context_lens, int block_kv, num_sms, indices)`
+(`attention.hpp:394`), not the internal `sm120::kMqaBlockKv = 128`
+(`sm120_dispatch.hpp:33`, used for logits stride at `attention.hpp:148`).
+
+vLLM passes `kv_cache_spec.num_states` (`v1/attention/backends/mla/indexer.py:1505`),
+and `num_states = block_size // tokens_per_state`
+(`v1/kv_cache_interface.py:193-196`). The indexer backend returned 128 for SM120:
+```python
+# v1/attention/backends/mla/indexer.py:262-263
+return [64 if current_platform.is_device_capability_family(90) else 128]
+```
+**Note the corroboration:** `FlashInferMLASparseSM120Backend` at
+`v1/attention/backends/mla/flashinfer_mla_sparse.py:174` already returns
+`[64, 256]`. So FlashInfer's own SM120 sparse-MLA backend agrees 64 is right; the
+DSv4.1 backends returning 128 look like they fell through an SM100-oriented
+`else`.
+
+**Finding 3 — all four declarations must agree**
+Changing only the indexer produced `No common block size for 128`
+(`v1/worker/utils.py:386`), because `utils.py:355-387` needs one size accepted by
+every backend in the group and the sparse-MLA and indexer caches share a
+physical block. Four sites:
+
+| file:line | before | after |
+|---|---|---|
+| `models/deepseek_v41/attention.py:522` | 32 | 64 |
+| `models/deepseek_v41/nvidia/flashinfer_sparse.py:158` | `[128]` | `[64]` on SM120 |
+| `models/deepseek_v41/sparse_mla.py:90` | `[64 if SM90 else 128]` | `[64]` on SM90+120 |
+| `v1/attention/backends/mla/indexer.py:262` | `[64 if SM90 else 128]` | `[64]` on SM90+120 |
+
+**Finding 4 — prefill gap (NOT worked around, the actual bug report)**
+```
+tvm.error.InternalError: Check failed: (ok) is false:
+Unsupported sparse-MLA prefill configuration:
+model=DSV4 num_heads=8 topk=128 page_block_size=64
+topk_extra=512 extra_page_block_size=32
+```
+Raised for all 8 workers during `compile_or_warm_up_model`.
+
+Gate, `flashinfer/data/csrc/sparse_mla_sm120_prefill.cu:324-325`
+(`dispatch_dsv4_dual`):
+```cpp
+if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
+    topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
+```
+Ours satisfies every term except the last: `extra_page_block_size` is 32.
+
+Argument mapping verified (`sparse_mla_sm120.cu:175-190`, `:225-232`):
+`page_block_size` <- `kv_cache`; `extra_page_block_size` <- `extra_kv_cache`. In
+vLLM's call (`models/deepseek_v41/nvidia/flashinfer_sparse.py:964,970`) those are
+the **SWA** cache and the **compressed** cache respectively — so it is the
+compressed page (32) that is rejected, not the SWA page (64).
+
+**Why 32 cannot simply be changed to 64**
+
+`extra_page_block_size` is a template parameter
+(`prefill_kernel.cuh:655-656`) because it changes the KV stride, and
+`PAGE_BLOCK_SIZE` is an index divisor (`prefill_kernel.cuh:639-652`):
+```cpp
+const int bi = idx / PAGE_BLOCK_SIZE;
+const int li = idx % PAGE_BLOCK_SIZE;
+```
+`PAGE_BLOCK_SIZE_EXTRA == 2` is not a small page but a **layout flag**
+(`prefill_kernel.cuh:685`):
+```cpp
+static constexpr bool USE_WFP8_ROW_XOR = DUAL_CACHE && (PAGE_BLOCK_SIZE_EXTRA == 2);
+```
+which selects a row-XOR swizzle in `ldmatrix_load_A_fp8_layout<...>`
+(`:1347`, `:1428`, `:1471`). So the accepted set is **{64 = token-paged, 2 =
+swizzled fp8 layout}**, and **32 has no instantiation** — hence a hard `ICHECK`.
+
+Compressed page = `swa_block // compress_ratio`. With the SWA block forced to 64
+by the decode gate (Finding 1):
+
+| layer type | ratio | compressed page | prefill |
+|---|---|---|---|
+| ratio-1 (22 of 40) | 1 | 64 | **ok** |
+| ratio-2 (18 of 40) | 2 | **32** | **fail** |
+
+Raising the SWA block to 128 to obtain a 64-entry compressed page would violate
+the decode gate. **So no single block size satisfies both.**
+
+**Requested outcome**
+
+Either of:
+1. an SM120 `dispatch_dsv4_dual` instantiation accepting a 32-entry compressed
+   page, or
+2. guidance on the intended mapping for v4.1 ratio-2 layers (whether the extra
+   cache is meant to be the swizzled `2` layout, in which case the fix is on the
+   vLLM side by writing that format).
+
+**Reproduction notes**
+- Checkpoint served unchanged; vLLM built from the synced fork, SM120-only.
+- `--tensor-parallel-size 8 --max-model-len 8192 --enforce-eager
+  --gpu-memory-utilization 0.85 --trust-remote-code`.
+- Weight load is slow (~450-570 s/rank) off NFS; not part of the bug.
+- Only the four block-size sites above were modified; no FlashInfer changes.
+
+**Honest scope**
+- `--enforce-eager`, 8192 context, single launch. CUDA graphs and long context
+  were not exercised.
+- Decode was observed to autotune and dispatch successfully, but **no request
+  was served end-to-end** — prefill fails first.
+- SGLang serves the same checkpoint on the same hardware, so this is specific to
+  vLLM's SM120 path.
+
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
