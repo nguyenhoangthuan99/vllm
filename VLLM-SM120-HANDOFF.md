@@ -591,6 +591,80 @@ with a loop that re-copies `docker exec <c> cat /tmp/recon.log` every 5 s.
 Guard each `docker exec` with `timeout` — an unguarded one in a slow container
 wedged the refresh loop and made a healthy run look stalled.
 
+
+## 2h. THE FIX WORKS — `block_size=64` clears the page gate; next blocker is the indexer
+
+**Experiment:** one-line change at `vllm/models/deepseek_v41/attention.py:522`,
+`DeepseekV4SWACache(..., block_size=32, ...)` -> `block_size=64` (the class
+default at `sparse_swa.py:83` is already 64).
+
+**Result — the measured tensor changed exactly as predicted:**
+
+```
+SMLADBG_CACHE shape=(133619, 128, 1, 584) ... impl_page_block_size=128 (need 64)
+SMLADBG_CACHE shape=(133619,  64, 1, 584) ... impl_page_block_size=64  (need 64)
+```
+
+```
+no decode kernel count: 0        <-- the original blocker is GONE
+GPU KV cache size: 1,130,792 tokens (138.04x concurrency), 28.67 GiB/worker
+```
+
+`page_block_size=32` is no longer produced; a cache with `shape[1] == 64` now
+exists and satisfies `_DECODE_DSV4_PAGE_BLOCK_SIZE`. The old error string
+appears **zero** times in the run.
+
+### The next blocker, one layer deeper
+
+```
+RuntimeError: Assertion error
+(/build/cmake-build-release/_deps/deepgemm-src/csrc/apis/attention.hpp:409):
+block_kv == 32 or block_kv == 64
+```
+
+Call chain (confirmed):
+`vllm/v1/attention/backends/mla/indexer.py:1503`
+`  -> get_paged_mqa_logits_metadata(seq_lens, self.kv_cache_spec.num_states, ...)`
+`  -> vllm/utils/deep_gemm.py:688`
+`  -> deepgemm csrc/apis/attention.hpp:409`, guarded by
+`if (arch_major == 12) DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);`
+
+and `num_states = block_size // tokens_per_state`
+(`kv_cache_interface.py:193-196`).
+
+So on SM120 the **indexer** cache's `block_kv` is also constrained, and it is
+currently **128**:
+
+| cache | tokens_per_state | block_size | num_states | vs assert |
+|---|---|---|---|---|
+| SWA/compressed (just fixed) | = compress_ratio | 128 | 64 | **passes** |
+| **indexer** | **1** | **128** | **128** | **fails** |
+
+The indexer cache is separate: `num_states` there is the full `block_size`
+because `tokens_per_state == 1`, whereas the compressed cache divides by
+`compress_ratio`.
+
+### Next experiment
+Give the indexer cache a `block_kv` of 32 or 64. Two candidate routes:
+1. halve the indexer's block size to 64 (would give `num_states = 64`); or
+2. find where the indexer spec's `block_size` is set and align it the way
+   `_get_indexer_block_alignment` (`platforms/cuda.py:428`) does for the
+   DeepGEMM paged-MQA path — note that function already special-cases
+   `is_device_capability_family(120)` to force page 64, but (per section 2d)
+   it is only reached for hybrid-attention/mamba models, so it never runs here.
+
+Route 2 is the principled one: upstream clearly *intends* SM120 to use 32 or 64
+for this kernel, and the alignment helper that would deliver it is not wired up
+for a pure-attention model.
+
+### Scope caveats on this result
+- `--enforce-eager`, `--max-model-len 8192`, single launch. This characterises
+  the decode-dispatch path only, not CUDA graphs or long context.
+- The run **still failed**, just later and for a different reason. It is not a
+  working deployment.
+- `SMLADBG_CACHE` printed two shapes (128 and 64), so more than one cache type
+  flows through `_as_sparse_cache`; the 128 one is the indexer's.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
