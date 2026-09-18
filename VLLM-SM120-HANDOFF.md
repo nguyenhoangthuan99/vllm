@@ -767,6 +767,89 @@ Run relaunched with all four changes. Still **unverified** — the previous thre
 attempts each surfaced a new, distinct blocker one layer deeper, so a clean
 result is not yet established.
 
+
+## 2k. DECODE NOW WORKS — prefill is the fourth blocker, and it is a page-size gate
+
+**The block-size fix succeeded.** Evidence from the run:
+
+```
+INFO [interface.py:621] Setting kv cache block size to 64 for FLASHINFER_MLA_SPARSE_DSV41 backend.
+INFO [gpu_worker.py:645] Available KV cache memory: 28.67 GiB
+INFO [kv_cache_utils.py:2459] GPU KV cache size: 1,114,653 tokens (136.07x concurrency)
+[AutoTuner]: Tuning sparse_mla_sm120_decode_dsv4: 100%|21/21
+```
+
+The `No common block size` error is gone, KV allocation succeeded, and — for the
+first time — the **FlashInfer SM120 sparse-MLA decode kernel autotunes 21
+variants**. Decode dispatch works. No `has no decode kernel` anywhere.
+
+Measured shapes moved as intended:
+
+```
+shape=(263288, 64, 1, 584)  impl_page_block_size=64 (need 64)   <-- compressed cache: FIXED
+shape=(263288, 32, 1, 584)  impl_page_block_size=32 (need 64)   <-- a second cache: STILL 32
+```
+
+### Fourth blocker: dual-cache prefill rejects `extra_page_block_size=32`
+```
+tvm.error.InternalError: Check failed: (ok) is false:
+Unsupported sparse-MLA prefill configuration:
+model=DSV4 num_heads=8 topk=128 page_block_size=64
+topk_extra=512 extra_page_block_size=32
+```
+All 8 workers, raised during `compile_or_warm_up_model`.
+
+### Exact gate, read from the FlashInfer JIT source
+`flashinfer/data/csrc/sparse_mla_sm120_prefill.cu:324-325`,
+`dispatch_dsv4_dual`:
+
+```cpp
+if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
+    topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
+```
+
+Against our values (`BI = 64`):
+
+| condition | ours | result |
+|---|---|---|
+| `topk == 128` | 128 | pass |
+| `topk_extra % BI == 0` | 512 % 64 = 0 | pass |
+| `extra_page_block_size == 64` | 32 | **fail** |
+| `extra_page_block_size == 2` | 32 | **fail** |
+
+So the **extra** cache's page must be **64 or 2**, and ours is **32**.
+
+Note the dispatch is entered because `extra_KV_cache != nullptr`
+(`sparse_mla_sm120_prefill.cu:417`), i.e. the dual-cache path is DSV4-only and
+used as soon as `extra_topk > 0`. `2` being an accepted value is a strong hint:
+it corresponds to a *compressed* extra page, not a token page.
+
+### Consequence — the `block_size=64` fix was incomplete
+Changing `DeepseekV4SWACache(block_size=...)` to 64 fixed the **main compressed**
+cache (64 confirmed) but the cache that reaches prefill as `extra_KV_cache`
+still reports 32. Two distinct caches, two distinct page sizes, and only one was
+addressed. The remaining `32` is a `/2` of 64 somewhere in the extra path —
+consistent with the earlier observation that `shape=(N, 32, ...)` reappeared
+alongside the fixed 64.
+
+### This is architecture-level, not cosmetic
+The user's read is right: v4.1's extra/swa cache topology differs from what the
+DSV4 dual-prefill kernel expects. The kernel wants `extra_page_block_size` in
+{2, 64}; v4.1 naturally produces 32 for this checkpoint. Resolving it means
+either
+- making the extra cache's page land on 64 (or on 2 where semantically correct), or
+- confirming whether v4.1 should take the **single-cache** path
+  (`dispatch_dsv4_single`) instead of dual at all — `extra_topk=512` suggests a
+  second cache is genuinely in play.
+
+### Progress ledger (each run reached strictly further)
+1. `page_block_size=32` decode reject -> fixed via `block_size: 32 -> 64`
+2. `block_kv == 32 or 64` DeepGEMM assert -> fixed via SM120 -> 64 (4 sites)
+3. `No common block size for 128` -> fixed by aligning all 4 declarations
+4. **decode autotunes successfully**; now `extra_page_block_size=32` in dual prefill
+
+Still **not serving**. `--enforce-eager`, 8k context, single launch throughout.
+
 ---
 
 ## 3. Earlier open question (SUPERSEDED by §2b — kept for the record)
